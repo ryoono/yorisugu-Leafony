@@ -147,13 +147,15 @@ const unsigned long INTERVAL_MS = 5000UL;
 
 // ---- 出力の順次LOW & 入力サンプリング ----
 unsigned long last_out_time = 0;
-const unsigned long OUT_INTERVAL = 1000; // 1秒
+const unsigned long OUT_INTERVAL = 500; // 0.5秒
 uint8_t out_index = 0;
 
 void printAdcMatrix() {
   // 行方向（入力A0,A1,A2）に出す → 1 4 7 ... と列優先で並んだ読み順になる
   for (uint8_t r = 0; r < NUM_IN; ++r) {
     for (uint8_t c = 0; c < NUM_OUT; ++c) {
+      if( adc[r][c] < 10 )  Serial.print(" ");
+      else if(adc[r][c] < 100) Serial.print(" ");
       Serial.print(adc[r][c]);
       if (c + 1 < NUM_OUT) Serial.print(' ');
     }
@@ -186,31 +188,38 @@ void loop() {
     applyState();
   }
 
-  // ==== 1秒おきに OUTPUT を順次 LOW、同タイミングで INPUT を1回だけ読み込む ====
+  // ==== 0.5秒おきにscan ====
   if (now - last_out_time >= OUT_INTERVAL) {
     last_out_time = now;
 
-    // 全出力を HIGH
-    for (uint8_t i = 0; i < NUM_OUT; ++i) digitalWrite(OUTPUT_PINS[i], HIGH);
+    for( uint8_t j=0; j<NUM_OUT;++j){
+      // 全出力を HIGH
+      // for (uint8_t i = 0; i < NUM_OUT; ++i) digitalWrite(OUTPUT_PINS[i], HIGH);
+  
+      // 今の列だけ LOW
+      digitalWrite(OUTPUT_PINS[out_index], LOW);
+  
+      // （必要ならRC安定待ち）
+      delayMicroseconds(2750);
+  
+      // このタイミングで INPUT を1回ずつ読む（列 out_index に格納）
+      for (uint8_t r = 0; r < NUM_IN; ++r) {
+        adc[r][out_index] = analogRead(INPUT_PINS[r]);
+        //delayMicroseconds(1000);
+      }
 
-    // 今の列だけ LOW
-    digitalWrite(OUTPUT_PINS[out_index], LOW);
-
-    // （必要ならRC安定待ち）
-    delayMicroseconds(5000);
-
-    // このタイミングで INPUT を1回ずつ読む（列 out_index に格納）
-    for (uint8_t r = 0; r < NUM_IN; ++r) {
-      adc[r][out_index] = analogRead(INPUT_PINS[r]);
+      digitalWrite(OUTPUT_PINS[out_index], HIGH);
+      // （必要ならRC安定待ち）
+      //delayMicroseconds(1000);
+  
+      // 最後の列（index=5）を読んだ直後に、3x6 行列をシリアル送信
+      if (out_index == (NUM_OUT - 1)) {
+        printAdcMatrix();
+      }
+  
+      // 次の列へ
+      out_index++;
+      if (out_index >= NUM_OUT) out_index = 0;
     }
-
-    // 最後の列（index=5）を読んだ直後に、3x6 行列をシリアル送信
-    if (out_index == (NUM_OUT - 1)) {
-      printAdcMatrix();
-    }
-
-    // 次の列へ
-    out_index++;
-    if (out_index >= NUM_OUT) out_index = 0;
   }
 }
