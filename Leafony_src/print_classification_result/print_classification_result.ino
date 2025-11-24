@@ -5,6 +5,16 @@
 #define LCD_ADRS 0x3E  // AQM1602XA I2Cアドレス
 #define LCD_COLS 16
 
+// ★ 省電力用：スリープ＆割り込み
+#include <avr/sleep.h>
+#include <avr/interrupt.h>
+
+// ★ デバッグ用：演算時間計測ピン（D5）
+// 必要ならスケッチの先頭などで #define DEBUG を有効化する
+#ifdef DEBUG
+  #define DEBUG_PIN 5
+#endif
+
 // ★ ロジスティック回帰のパラメータ（標準化吸収済み, 生ADC値用）
 #include "logistic_params_raw.h"
 
@@ -38,9 +48,10 @@ enum DispState : uint8_t {
   STATE_OFF = 0,
   STATE_TAKENOKO = 1,
   STATE_KINOKO  = 2,
-  STATE_CHAR_SAMPLE = 3
+  STATE_NOT_FOUND = 3
 };
 DispState g_state = STATE_OFF;
+DispState g_state_buf = STATE_OFF;
 
 // ---- 固定コントラスト ----
 static const uint8_t FIXED_CONTRAST = 35; // 0..63
@@ -51,14 +62,14 @@ static inline void writeCommand(uint8_t cmd) {
   Wire.write(0x00);  // Co=0, RS=0
   Wire.write(cmd);
   Wire.endTransmission();
-  delay(2);
+  delayMicroseconds(500);
 }
 static inline void writeData(uint8_t data) {
   Wire.beginTransmission(LCD_ADRS);
   Wire.write(0x40);  // Co=0, RS=1
   Wire.write(data);
   Wire.endTransmission();
-  delay(1);
+  delayMicroseconds(500);
 }
 
 // ---- 便利ヘルパー ----
@@ -73,11 +84,17 @@ static inline void putCGRAM(uint8_t code) { writeData(code & 0x07); }
 void initPins() {
   for (uint8_t i = 0; i < NUM_OUT; ++i) {
     pinMode(OUTPUT_PINS[i], OUTPUT);
-    digitalWrite(OUTPUT_PINS[i], HIGH);
+    fastWriteHigh(i);
   }
   for (uint8_t i = 0; i < NUM_IN; ++i) {
     pinMode(INPUT_PINS[i], INPUT); // 外付けプルダウン
   }
+
+#ifdef DEBUG
+  // D5 を演算時間計測用の出力にする
+  pinMode(DEBUG_PIN, OUTPUT);
+  digitalWrite(DEBUG_PIN, LOW);
+#endif
 }
 
 // ---- LCD初期化 ----
@@ -120,7 +137,7 @@ void lcdClearAll() {
   setCursor(0, 0); for (int i = 0; i < LCD_COLS; ++i) writeData(0x20);
   setCursor(0, 1); for (int i = 0; i < LCD_COLS; ++i) writeData(0x20);
   writeCommand(0x01);
-  delay(2);
+  delayMicroseconds(500);
 }
 
 // ---- パターン ----
@@ -150,27 +167,35 @@ void drawTakenokoPattern() {
   writeSpaces(12);
   putCGRAM(6); putCGRAM(7);
 }
+void drawNotFoundPattern() {
+  lcdClearAll();
+  setCursor(0, 0);
+
+  const char* msg = "Not Found";
+  const uint8_t len = 9;                 // "Not Found" の文字数
+  uint8_t left = (LCD_COLS - len) >> 1;  // ÷2（中央寄せ用）
+
+  // 1行目中央に "Not Found" を表示
+  writeSpaces(left);
+  writeAsciiStr(msg);
+  // 残りは lcdClearAll() 済みなので特に何もしなくてOK
+}
 
 // ---- 状態適用 ----
-void applyState() {
+void printResult() {
   switch (g_state) {
-    case STATE_OFF:       lcdClearAll();        break;
-    case STATE_TAKENOKO:  drawTakenokoPattern();break;
-    case STATE_KINOKO:    drawKinokoPattern();  break;
-    case STATE_CHAR_SAMPLE:                     break;
+    case STATE_OFF:       lcdClearAll();         break;
+    case STATE_TAKENOKO:  drawTakenokoPattern(); break;
+    case STATE_KINOKO:    drawKinokoPattern();   break;
+    case STATE_NOT_FOUND: drawNotFoundPattern(); break;
   }
 }
 
-// ---- メイン処理（LCDシーケンス）----
-const DispState SEQ[4] = { STATE_OFF, STATE_TAKENOKO, STATE_OFF, STATE_KINOKO };
-uint8_t seq_idx = 0;
-unsigned long last_sw = 0;
-const unsigned long INTERVAL_MS = 5000UL;
+// 何もない場合の判定 学習データ最大(2977)より少し大きい値にしておく
+const uint16_t NO_OBJECT_THRESHOLD = 3200;
 
-// ---- 出力の順次LOW & 入力サンプリング ----
-unsigned long last_out_time = 0;
-const unsigned long OUT_INTERVAL = 500; // 0.5秒
-uint8_t out_index = 0;
+// ★ 1秒ごとに計測処理を実行するためのフラグ（Timer1割り込みでセット）
+volatile bool g_do_measure = false;
 
 // ★ 光センサ値(adc[3][6])からラベル(0〜3)を推論
 int predictLabelFromAdc() {
@@ -180,10 +205,8 @@ int predictLabelFromAdc() {
   // 学習時と同じ並び順（行優先: r→c）で18要素にフラット化
   for (uint8_t r = 0; r < NUM_IN; ++r) {
     for (uint8_t c = 0; c < NUM_OUT; ++c) {
-      if (idx < LOGI_NUM_FEATURES) {
-        x[idx] = (float)adc[r][c];   // 生のanalogRead値をそのまま使う
-        ++idx;
-      }
+      // NUM_IN * NUM_OUT == LOGI_NUM_FEATURES(18) 固定なので境界チェックは不要
+      x[idx++] = (float)adc[r][c];   // 生のanalogRead値をそのまま使う
     }
   }
 
@@ -203,74 +226,115 @@ int predictLabelFromAdc() {
   return best_k;
 }
 
-void printAdcMatrix() {
-  // ★ まずラベルを推論
-  int label = predictLabelFromAdc();
+// ★ Timer1 を 1Hz（1秒ごと）CTC割り込みに設定
+void initTimer1_1Hz() {
+  cli();              // 割り込み一時禁止
 
-  // フォーマット: label,adc00,adc01,...,adc(2,5)
-  Serial.print(label);
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
 
-  for (uint8_t r = 0; r < NUM_IN; ++r) {
-    for (uint8_t c = 0; c < NUM_OUT; ++c) {
-      Serial.print(',');
-      Serial.print(adc[r][c]);
+  // CTCモード (WGM12 = 1)
+  TCCR1B |= (1 << WGM12);
+
+  // 8MHz / 1024 = 7812.5 Hz → 約1秒ごとに割り込み
+  OCR1A = 7812;  // 1秒弱だが展示用途なら十分
+
+  // プリスケーラ 1024 設定 (CS12=1, CS10=1)
+  TCCR1B |= (1 << CS12) | (1 << CS10);
+
+  // 比較一致A割り込み許可
+  TIMSK1 |= (1 << OCIE1A);
+
+  sei();              // 割り込み許可
+}
+
+// ★ Timer1 比較一致A割り込みハンドラ：フラグを立てるだけ
+ISR(TIMER1_COMPA_vect) {
+  g_do_measure = true;
+}
+
+// 物体認識と結果表示関数
+void runSensorScanAndInference(){
+#ifdef DEBUG
+  // ★ 計測開始：D5(HIGH)
+  PORTD |= _BV(PD5);
+#endif
+
+  uint16_t adc_sum = 0; // 何もない場合を判定するための、ADC合計値
+
+  // FETを順にONし、光センサを3つずつ読み込む(6列分)
+  for (uint8_t j = 0; j < NUM_OUT; ++j) {
+
+    // 対象の列だけ LOW(FET ON)
+    fastWriteLow(j);   // ★ digitalWrite → レジスタ直叩き
+
+    // （必要ならRC安定待ち）
+    delayMicroseconds(2500);
+
+    // このタイミングで INPUT を1回ずつ読む（列 j に格納）
+    for (uint8_t r = 0; r < NUM_IN; ++r) {
+      (void)analogRead(INPUT_PINS[r]);           // 捨て読み（ADC内部の前回値を追従させる）
+      adc[r][j] = analogRead(INPUT_PINS[r]);
+      adc_sum += adc[r][j];
     }
+
+    // 対象の列だけ HIGH(FET OFF)
+    fastWriteHigh(j);  // ★ digitalWrite → レジスタ直叩き
   }
-  Serial.println(); // 行終端（1サンプル=1行）
+
+  // 最後の列（index=5）を読んだ直後に、推論 & LCD出力処理
+  // 物体が何もない場合は、推論をしない
+  // LCD表示が前回と変更ない場合は、出力しない
+  if (adc_sum >= NO_OBJECT_THRESHOLD) { // 物体が何もない場合
+    g_state = STATE_NOT_FOUND;
+  }
+  else { // 物体がある場合
+    int label = predictLabelFromAdc();
+    if ((label == 0) || (label == 1))  g_state = STATE_KINOKO;
+    else                               g_state = STATE_TAKENOKO;
+  }
+
+  if (g_state != g_state_buf)  printResult();
+  g_state_buf = g_state;
+
+#ifdef DEBUG
+  // ★ 計測終了：D5(LOW)
+  PORTD &= ~_BV(PD5);
+#endif
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Serial.begin(115200);
   Wire.begin();
   initPins();
   initLCD();
   defineCGRAMAll();
 
-  g_state = SEQ[seq_idx];
-  applyState();
+  g_state = STATE_OFF;
+  printResult();
 
-  last_sw = millis();
-  last_out_time = last_sw;
+  // ★ 1秒タイマ割り込みの初期化
+  initTimer1_1Hz();
 }
 
 void loop() {
-  // ==== LCD更新処理（既存） ====
-  unsigned long now = millis();
-  if (now - last_sw >= INTERVAL_MS) {
-    last_sw = now;
-    seq_idx = (seq_idx + 1) & 0x03;
-    g_state = SEQ[seq_idx];
-    applyState();
+  // ===== スリープ =====
+  if (!g_do_measure) {
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    sleep_enable();
+    sleep_cpu();    // ← Timer1で起きる
+    sleep_disable();
   }
 
-  // ==== 0.5秒おきにscan ====
-  if (now - last_out_time >= OUT_INTERVAL) {
-    last_out_time = now;
-
-    for( uint8_t j=0; j<NUM_OUT;++j){
-
-      // 今の列だけ LOW
-      fastWriteLow(out_index);   // ★ digitalWrite → レジスタ直叩き
-
-      // （必要ならRC安定待ち）
-      delayMicroseconds(2750);
-
-      // このタイミングで INPUT を1回ずつ読む（列 out_index に格納）
-      for (uint8_t r = 0; r < NUM_IN; ++r) {
-        (void)analogRead(INPUT_PINS[r]);           // 捨て読み（ADC内部の前回値を追従させる）
-        adc[r][out_index] = analogRead(INPUT_PINS[r]);
-      }
-
-      fastWriteHigh(out_index);  // ★ digitalWrite → レジスタ直叩き
-
-      // 最後の列（index=5）を読んだ直後に、3x6 行列をシリアル送信
-      if (out_index == (NUM_OUT - 1)) {
-        printAdcMatrix();
-      }
-
-      // 次の列へ
-      out_index++;
-      if (out_index >= NUM_OUT) out_index = 0;
-    }
+  // ===== ここへ来たら、Timer1が1秒ごとに起こした証拠 =====
+  if (!g_do_measure) {
+    return;         // 念のため
   }
+  g_do_measure = false;
+
+  // ===== 1秒ごとの測定処理（元の処理をそのまま置く） =====
+  runSensorScanAndInference();   // ← あなたのADC読み込み＋推論＋LCD更新処理
+
+  // ===== 処理が終わったので、次の割り込みまでスリープへ =====
 }
