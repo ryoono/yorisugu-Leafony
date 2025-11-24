@@ -11,6 +11,7 @@
 
 // ★ デバッグ用：演算時間計測ピン（D5）
 // 必要ならスケッチの先頭などで #define DEBUG を有効化する
+#define DEBUG
 #ifdef DEBUG
   #define DEBUG_PIN 5
 #endif
@@ -256,10 +257,7 @@ ISR(TIMER1_COMPA_vect) {
 
 // 物体認識と結果表示関数
 void runSensorScanAndInference(){
-#ifdef DEBUG
-  // ★ 計測開始：D5(HIGH)
-  PORTD |= _BV(PD5);
-#endif
+
 
   uint16_t adc_sum = 0; // 何もない場合を判定するための、ADC合計値
 
@@ -290,18 +288,21 @@ void runSensorScanAndInference(){
     g_state = STATE_NOT_FOUND;
   }
   else { // 物体がある場合
+#ifdef DEBUG
+  // ★ 計測開始：D5(HIGH)
+  PORTD |= _BV(PD5);
+#endif
     int label = predictLabelFromAdc();
+#ifdef DEBUG
+  // ★ 計測終了：D5(LOW)
+  PORTD &= ~_BV(PD5);
+#endif
     if ((label == 0) || (label == 1))  g_state = STATE_KINOKO;
     else                               g_state = STATE_TAKENOKO;
   }
 
   if (g_state != g_state_buf)  printResult();
   g_state_buf = g_state;
-
-#ifdef DEBUG
-  // ★ 計測終了：D5(LOW)
-  PORTD &= ~_BV(PD5);
-#endif
 }
 
 void setup() {
