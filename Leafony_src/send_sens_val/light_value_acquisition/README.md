@@ -1,0 +1,2 @@
+send_sens_val.ino PCに光センサデータを送信するプログラム(Leafony ATmega328P)
+receive_data2csv.py Leafonyからの光センサデータを受信してcsv保存するプログラム
