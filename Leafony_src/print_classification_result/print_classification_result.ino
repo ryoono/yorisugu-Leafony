@@ -11,7 +11,7 @@
 
 // ★ デバッグ用：演算時間計測ピン（D5）
 // 必要ならスケッチの先頭などで #define DEBUG を有効化する
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
   #define DEBUG_PIN 5
 #endif
